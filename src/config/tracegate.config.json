@@ -1,0 +1,40 @@
+{
+  "logger": {
+    "level": "info",
+    "fileLogs": {
+      "enabled": true,
+
+      "rotation": {
+        "enabled": true,
+        "interval": "1d",
+        "compress": "gzip"
+      }
+    },
+    "cloud": {
+      "enabled": false,
+      "provider": "cloudwatch",
+      "region": "us-east-1",
+      "endpoint": "",
+      "apiKey": ""
+    }
+  },
+  "routes": {
+    "https://localhost.teste": {
+      "target": "http://localhost:8081",
+      "tls": {
+        "enabled": true,
+        "certPath": "/Users/gmprestes/repos/tracegate/cert/cert.crt",
+        "keyPath": "/Users/gmprestes/repos/tracegate/cert/key.pem"
+      },
+      "waf": {
+        "mode": "block",
+        "blockIPs": ["192.168.1.10"],
+        "blockUserAgents": ["curl", "python", "nmap"],
+        "blockPaths": ["/admin", "/.env", "/phpmyadmin"]
+      }
+    }
+  },
+  "tls": {
+    "certDirectory": "./certs"
+  }
+}
