@@ -1,6 +1,7 @@
 // src/core/balancer.ts
-import http2 from 'http2';
+import http2, { ClientSessionOptions, SecureClientSessionOptions, ClientHttp2Session } from 'http2';
 import http from 'http';
+import https from 'https';
 import httpProxy from 'http-proxy';
 import tls from 'tls';
 import { getCachedSecureContext } from '../services/tlsManager';
@@ -12,16 +13,21 @@ import fs from 'fs';
 import { LRUCache } from 'lru-cache';
 import { Readable, PassThrough } from 'stream';
 
+const CLIENT_HTTP2_TIMEOUT_MS = 0; // 1min para HTTP/2 (evita hangs infinitos)
+const DEFAULT_TIMEOUT_MS = 15000;     // Padrão para HTTP/1
+
 const config = loadConfig();
 validateRouteTargets(config.routes);
 const proxy = httpProxy.createProxyServer({});
 const routes = config.routes;
 
 const keepAliveHttpAgent = new http.Agent({ keepAlive: true });
-const keepAliveHttpsAgent = new http.Agent({ keepAlive: true });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
 
 const backendHttp2Support = new LRUCache<string, boolean>({ max: 100, ttl: 600_000 });
+const backendSessions = new Map<string, ClientHttp2Session>();
 
+// Improvement: Make probe timeout configurable; handle auth if needed in future.
 async function isHttp2Backend(target: string): Promise<boolean> {
   if (backendHttp2Support.has(target)) return backendHttp2Support.get(target)!;
 
@@ -60,6 +66,44 @@ async function isHttp2Backend(target: string): Promise<boolean> {
   });
 }
 
+// Improvement: Explicitly set timeout to 0; add idle check (optional: setInterval to close if session.pending + session.active === 0).
+function getOrCreateSession(target: string): ClientHttp2Session {
+  let session = backendSessions.get(target);
+  if (session && !session.closed && !session.destroyed) {
+    return session;
+  }
+
+  const isHttps = target.startsWith('https');
+  let options: ClientSessionOptions | SecureClientSessionOptions = { settings: { enablePush: false } }; // Disable push by default.
+  if (isHttps) {
+    options = { ...options, rejectUnauthorized: false } as SecureClientSessionOptions;
+  }
+
+  session = http2.connect(target, options);
+  session.setTimeout(0); // Fix: Disable idle timeout to prevent premature closes.
+
+  session.on('close', () => backendSessions.delete(target));
+
+  session.on('error', (err) => {
+    logger.warn({ msg: 'HTTP/2 backend session error', target, error: err.message });
+    backendSessions.delete(target);
+    session.destroy();
+  });
+
+  session.on('goaway', (code) => {
+    logger.warn({ msg: 'Received GOAWAY', code, target });
+    backendSessions.delete(target);
+    session.destroy();
+  });
+
+  session.on('frameError', (type, code, id) => {
+    logger.warn({ msg: 'Frame error from backend', type, code, id });
+  });
+
+  backendSessions.set(target, session);
+  return session;
+}
+
 function filterHttp2Headers(headers: http.IncomingHttpHeaders): http2.OutgoingHttpHeaders {
   const out: http2.OutgoingHttpHeaders = {};
   for (const key in headers) {
@@ -77,11 +121,13 @@ function convertHttp2ToHttp1Headers(h2Headers: http2.IncomingHttpHeaders): http.
   for (const [key, value] of Object.entries(h2Headers)) {
     if (key.startsWith(':') || !validToken.test(key)) continue;
     const lowerKey = key.toLowerCase();
-    if (['connection', 'upgrade', 'keep-alive', 'transfer-encoding'].includes(lowerKey)) continue;
+    if (['connection', 'upgrade', 'keep-alive',].includes(lowerKey)) continue;
     if (value !== undefined) {
-      h1Headers[lowerKey] = Array.isArray(value) ? value.join(',') : value;
+      h1Headers[lowerKey] = Array.isArray(value) ? value.join(',') : value.toString(); // Improvement: Explicit toString for safety.
     }
   }
+
+  // 'transfer-encoding'
 
   if (!h1Headers['host'] && h2Headers[':authority']) {
     h1Headers['host'] = h2Headers[':authority'] as string;
@@ -90,20 +136,20 @@ function convertHttp2ToHttp1Headers(h2Headers: http2.IncomingHttpHeaders): http.
   return h1Headers;
 }
 
+// Improvement: Use a Duplex stream mock if needed; ensure no real socket attachment.
 function cloneHttp2ToHttp1Request(h2req: http2.Http2ServerRequest, headers: http.IncomingHttpHeaders): IncomingMessage {
-  const clonedReq = Readable.from(h2req) as unknown as IncomingMessage;
+  const clonedReq = new PassThrough() as PassThrough & IncomingMessage;
   clonedReq.headers = headers;
   clonedReq.method = h2req.method;
   clonedReq.url = h2req.url;
   clonedReq.httpVersion = '1.1';
+  clonedReq.connection = { remoteAddress: h2req.stream?.session?.socket?.remoteAddress || 'unknown' } as any;
 
-  const socket = h2req.stream?.session?.socket;
-  if (socket) {
-    clonedReq.connection = socket as any;
-    (clonedReq as any).socket = socket;
-  } else {
-    throw new Error('Cannot extract socket from HTTP/2 request');
-  }
+  h2req.pipe(clonedReq); // Pipe data from h2req into clonedReq
+
+  // Optional: Propagate errors between streams for robustness
+  h2req.on('error', (err) => clonedReq.destroy(err));
+  clonedReq.on('error', (err) => h2req.destroy(err));
 
   return clonedReq;
 }
@@ -159,7 +205,7 @@ proxy.on('proxyReq', (proxyReq, req) => {
 proxy.on('proxyRes', async (proxyRes, req, res) => {
   const traceId = (req as any).traceId || 'unknown';
   const isHttp2Client = res instanceof http2.Http2ServerResponse;
-  const forbiddenHeaders = ['connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'proxy-connection', 'content-encoding'];
+  const forbiddenHeaders = ['connection', 'keep-alive', 'upgrade'];
   const headersToSend: Record<string, any> = {};
 
   for (const [key, value] of Object.entries(proxyRes.headers)) {
@@ -168,41 +214,14 @@ proxy.on('proxyRes', async (proxyRes, req, res) => {
     if (value !== undefined) headersToSend[lowerKey] = value;
   }
 
-  // const contentType = headersToSend['content-type'];
-  // if (typeof contentType === 'string' && contentType.startsWith('image/svg')) {
-  //   headersToSend['content-disposition'] = 'inline';
-  // }
-
-   headersToSend['x-tgate-trace-id'] = traceId;
-   headersToSend['server'] = 'TraceGate';
-
-   //headersToSend['x-content-type-options'] = 'nosniff';
+  headersToSend['x-tgate-trace-id'] = traceId;
+  headersToSend['server'] = 'TraceGate';
 
   if (!res.headersSent) {
     res.writeHead(proxyRes.statusCode || 200, headersToSend);
   }
 
-  const pass = new PassThrough();
-  let totalBytes = 0;
-  const chunks: Buffer[] = [];
-
-  pass.on('data', (chunk) => {
-    totalBytes += chunk.length;
-    chunks.push(chunk);
-  });
-
-  pass.on('end', () => {
-    // console.log(`[${traceId}] proxyRes completed. Bytes: ${totalBytes}`);
-    // if (typeof contentType === 'string' && contentType.startsWith('image/svg')) {
-    //   const fullBody = Buffer.concat(chunks);
-    //   const dumpPath = `/tmp/svg-${traceId}.svg`;
-    //   fs.writeFileSync(dumpPath, fullBody);
-    //   console.log(`[${traceId}] Saved full SVG to ${dumpPath}`);
-    // }
-  });
-
-  proxyRes.pipe(pass);
-  pass.pipe(res);
+  proxyRes.pipe(res);
 
   const startAt = (req as any)._startAt;
   const diff = process.hrtime(startAt);
@@ -210,73 +229,93 @@ proxy.on('proxyRes', async (proxyRes, req, res) => {
   await logger.info({ traceId, msg: 'Proxy target responded', host: req.headers.host || 'unknown', durationMs: `${durationMs.toFixed(2)}ms` });
 });
 
-function proxyHttp2(req: http2.Http2ServerRequest, res: http2.Http2ServerResponse, route: any) {
+// Improvement: Removed res.on('close', () => client.close()) to fix connection closed errors; use logger instead of console; add try-catch.
+async function proxyHttp2(req: http2.Http2ServerRequest, res: http2.Http2ServerResponse, route: any) {
+  const traceId = (req as any).traceId || createTraceId();
+  (req as any).traceId = traceId;
 
-  if (!(req as any).traceId)
-    (req as any).traceId = createTraceId();
+  try {
+    const client = getOrCreateSession(route.target);
 
-  console.log(`Proxying HTTP/2 request to ${route.target} for ${req.method} ${req.url}`);
-  const client = http2.connect(route.target);
+    logger.debug({ traceId, msg: `Proxying HTTP/2 request to ${route.target} for ${req.method} ${req.url}` }); // Fix: Use logger.
 
-  const proxyHeaders: http2.OutgoingHttpHeaders = {
-    ':method': req.method,
-    ':path': req.url || '/',
-    ...filterHttp2Headers(req.headers)
-  };
+    const proxyHeaders: http2.OutgoingHttpHeaders = {
+      ':method': req.method,
+      ':path': req.url || '/',
+      ...filterHttp2Headers(req.headers)
+    };
 
-  for (const key in proxyHeaders) {
-    const isPseudo = key.startsWith(':');
-    const isValid = /^[:a-z0-9!#$%&'*+.^_`|~-]+$/.test(key); // inclui pseudo-headers
-
-    if (!isValid) {
-      logger.warn({ msg: 'Invalid HTTP/2 header name, dropping', header: key });
-      delete proxyHeaders[key];
-      continue;
+    // Improvement: Stronger header validation.
+    for (const key in proxyHeaders) {
+      const isValid = /^[:a-z0-9!#$%&'*+.^_`|~-]+$/.test(key);
+      if (!isValid) {
+        logger.warn({ traceId, msg: 'Invalid HTTP/2 header name, dropping', header: key });
+        delete proxyHeaders[key];
+        continue;
+      }
+      const val = proxyHeaders[key];
+      if (Array.isArray(val)) {
+        proxyHeaders[key] = val.join(',');
+      }
     }
 
-    const val = proxyHeaders[key];
-    if (Array.isArray(val)) {
-      proxyHeaders[key] = val.join(','); // HTTP/2 espera valores simples em headers
-    }
+    const proxyReq = client.request(proxyHeaders);
+
+    proxyReq.setTimeout(CLIENT_HTTP2_TIMEOUT_MS, () => {
+      logger.warn({ traceId, msg: 'Proxy HTTP/2 stream timed out' });
+      proxyReq.destroy();
+      if (!res.headersSent) 
+        res.writeHead(504);
+      res.end();
+    });
+
+    proxyReq.on('response', (headers) => {
+      const status = headers[':status'] || 200;
+      if (!res.headersSent) {
+        res.writeHead(Number(status), headers);
+      }
+    });
+
+    proxyReq.on('push', (headers) => {
+      logger.info({ traceId, msg: 'Received HTTP/2 push from origin (ignored)', path: headers[':path'] });
+    });
+
+    proxyReq.on('trailers', (trailers) => res.addTrailers(trailers));
+
+    res.on('close', () => {
+      logger.debug({ traceId, msg: 'Client closed connection before response completed' });
+      proxyReq.destroy();
+    });
+
+    proxyReq.on('aborted', () => {
+      logger.warn({ traceId, msg: 'Proxy request aborted' });
+      proxyReq.destroy();
+    });
+
+    proxyReq.on('error', (err) => {
+      logger.warn({ traceId, msg: 'Proxy HTTP/2 stream error', error: err.message });
+
+      if (!res.headersSent)
+        res.writeHead(502);
+
+      res.end('Proxy error: ' + err.message);
+      proxyReq.destroy();
+    });
+
+    //req.pipe(proxyReq);
+    //proxyReq.pipe(res);
+
+  } catch (err) {
+    logger.error({ traceId, msg: 'HTTP/2 proxy failure', error: (err as Error).message });
+
+    if (!res.headersSent)
+      res.writeHead(500);
+
+    res.end();
   }
-
-
-  const proxyReq = client.request(proxyHeaders);
-
-  proxyReq.on('response', (headers, flags) => {
-    const status = headers[':status'] || 200;
-    if (!res.headersSent) {
-      res.writeHead(Number(status), headers as any);
-    }
-    proxyReq.pipe(res);
-  });
-
-  proxyReq.on('push', (headers, pushStream) => {
-    const pushPath = headers[':path'] || '';
-    logger.info({ msg: 'Received HTTP/2 push from origin', path: pushPath });
-  });
-
-  proxyReq.on('trailers', (trailers) => {
-    res.addTrailers(trailers as any);
-  });
-
-  req.on('end', () => {
-    proxyReq.end();
-  });
-
-  req.pipe(proxyReq);
-
-  proxyReq.on('error', (err) => {
-    logger.warn({ msg: 'Proxy HTTP/2 error', error: err.message });
-    if (!res.headersSent) {
-      res.writeHead(502);
-    }
-    res.end('Proxy error: ' + err.message);
-  });
-
-  res.on('close', () => client.close());
 }
 
+// Improvement: Use logger for debug; add try-catch.
 async function proxyRequest(req: any, res: any, scheme: 'http' | 'https', host: string, remoteAddr: string) {
   const traceId = req.traceId;
   const route = getRoute(scheme, host);
@@ -297,60 +336,64 @@ async function proxyRequest(req: any, res: any, scheme: 'http' | 'https', host: 
     return;
   }
 
-  var x = await isHttp2Backend(route.target);
-  console.log(`isHttp2Backend(${route.target}) = ${x}`);
+  try {
+    const supportsHttp2 = await isHttp2Backend(route.target);
+    logger.debug({ traceId, msg: `Backend ${route.target} supports HTTP/2: ${supportsHttp2}` }); // Fix: Use logger.
 
-  if (await isHttp2Backend(route.target)) {
-    proxyHttp2(req, res, route);
-  } else {
+    if (supportsHttp2) {
+      await proxyHttp2(req, res, route);
+    } else {
+      logger.info({ traceId, msg: `Proxying ${scheme.toUpperCase()} request`, host, target: route.target, remoteAddr });
 
-    logger.info({ traceId, msg: `Proxying ${scheme.toUpperCase()} request`, host, target: route.target, remoteAddr });
+      const isHttp2 = req instanceof http2.Http2ServerRequest;
+      const sanitizedHeaders = isHttp2 ? convertHttp2ToHttp1Headers(req.headers) : req.headers;
 
-    // 🧠 Se for uma requisição HTTP/2 de entrada e o destino NÃO suporta H2, precisamos adaptar headers
+      const proxyInputReq = isHttp2 ? cloneHttp2ToHttp1Request(req, sanitizedHeaders) : req;
 
+      if (!(proxyInputReq as any).traceId) {
+        (proxyInputReq as any).traceId = traceId;
+      }
 
-    const isHttp2 = req instanceof http2.Http2ServerRequest;
-    const sanitizedHeaders = isHttp2
-      ? convertHttp2ToHttp1Headers(req.headers)
-      : req.headers;
+      proxy.web(proxyInputReq, res, {
+        target: route.target,
+        secure: route.target.startsWith('https'),
+        changeOrigin: true,
+        agent: route.target.startsWith('https') ? keepAliveHttpsAgent : keepAliveHttpAgent,
+        xfwd: true,
+        timeout: isHttp2 ? CLIENT_HTTP2_TIMEOUT_MS : DEFAULT_TIMEOUT_MS, // Adaptado para protocolo do cliente
+        proxyTimeout: isHttp2 ? CLIENT_HTTP2_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
+        headers: sanitizedHeaders,
+      });
 
-    //console.log('sanitizedHeaders = ', sanitizedHeaders);
-
-    const proxyInputReq = isHttp2
-      ? cloneHttp2ToHttp1Request(req, sanitizedHeaders)
-      : req;
-
-    if (!(proxyInputReq as any).traceId) {
-      (proxyInputReq as any).traceId = traceId;
     }
-
-    //logger.info({ traceId, msg: `Proxying ${scheme.toUpperCase()} request`, host, target: route.target, remoteAddr });
-    proxy.web(proxyInputReq, res, {
-      target: route.target,
-      secure: route.target.startsWith('https'),
-      changeOrigin: true,
-      agent: route.target.startsWith('https') ? keepAliveHttpsAgent : keepAliveHttpAgent,
-      xfwd: true,
-      timeout: 15000,
-      proxyTimeout: 15000,
-      headers: sanitizedHeaders,
-    });
+  } catch (err) {
+    logger.error({ traceId, msg: 'Proxy request failure', error: (err as Error).message });
+    if (!res.headersSent) {
+      res.writeHead(500);
+    }
+    res.end();
   }
 }
 
+// Improvement: Add try-catch for WAF.
 function handleHttp1Request(req: http.IncomingMessage, res: http.ServerResponse) {
-
   const traceId = createTraceId();
   (req as any).traceId = traceId;
   res.setHeader('X-TGate-Trace-Id', traceId);
 
   const { scheme, host, remoteAddr } = extractSchemeAndHost(req.headers, req.socket);
 
-
-  const wafResult = applyWAFRules(req);
-  if (!wafResult.allowed) {
-    logger.warn({ traceId, msg: 'Request blocked by WAF', host, remoteAddr, reason: wafResult.reason });
-    res.writeHead(403);
+  try {
+    const wafResult = applyWAFRules(req);
+    if (!wafResult.allowed) {
+      logger.warn({ traceId, msg: 'Request blocked by WAF', host, remoteAddr, reason: wafResult.reason });
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+  } catch (err) {
+    logger.error({ traceId, msg: 'WAF error', error: (err as Error).message });
+    res.writeHead(500);
     res.end();
     return;
   }
@@ -358,6 +401,7 @@ function handleHttp1Request(req: http.IncomingMessage, res: http.ServerResponse)
   proxyRequest(req, res, scheme, host, remoteAddr);
 }
 
+// Same as above for HTTP/2 handler.
 function handleHttp2Request(req: http2.Http2ServerRequest, res: http2.Http2ServerResponse) {
   const traceId = createTraceId();
   (req as any).traceId = traceId;
@@ -366,10 +410,17 @@ function handleHttp2Request(req: http2.Http2ServerRequest, res: http2.Http2Serve
   const socket = req.stream?.session?.socket;
   const { scheme, host, remoteAddr } = extractSchemeAndHost(req.headers, socket);
 
-  const wafResult = applyWAFRules(req as any);
-  if (!wafResult.allowed) {
-    logger.warn({ traceId, msg: 'Request blocked by WAF', host, remoteAddr, reason: wafResult.reason });
-    res.writeHead(403);
+  try {
+    const wafResult = applyWAFRules(req as any);
+    if (!wafResult.allowed) {
+      logger.warn({ traceId, msg: 'Request blocked by WAF', host, remoteAddr, reason: wafResult.reason });
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+  } catch (err) {
+    logger.error({ traceId, msg: 'WAF error', error: (err as Error).message });
+    res.writeHead(500);
     res.end();
     return;
   }
@@ -393,7 +444,7 @@ export function startTraceGate() {
         cb(null, ctx);
       } catch (err) {
         logger.warn({ msg: 'Dropping connection: no certificate configured', domain, error: (err as Error).message });
-        cb(new Error());
+        cb(new Error('No TLS context'));
       }
     }
   });

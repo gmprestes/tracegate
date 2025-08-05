@@ -19,12 +19,12 @@
     }
   },
   "routes": {
-    "https://localhost.teste": {
-      "target": "http://localhost:8081",
+    "https://teste.sigecloud.com.br": {
+      "target": "http://localhost:4200",
       "tls": {
         "enabled": true,
-        "certPath": "/Users/gmprestes/repos/tracegate/cert/cert.crt",
-        "keyPath": "/Users/gmprestes/repos/tracegate/cert/key.pem"
+        "certPath": "/Users/gmprestes/repos/tracegate/cert/teste_cert.pem",
+        "keyPath": "/Users/gmprestes/repos/tracegate/cert/teste_key.pem"
       },
       "waf": {
         "mode": "block",
